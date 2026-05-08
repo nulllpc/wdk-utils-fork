@@ -20,10 +20,11 @@
  */
 
 import { bech32 } from '@scure/base'
+import * as bolt11 from 'bolt11'
 
 const VALID_INVOICE_PREFIXES = ['lnbc', 'lntb', 'lnbcrt', 'lnsb']
-/** Lightning address: must have dot in domain (user@domain.tld) */
-const LIGHTNING_ADDRESS_EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+/** Lightning address: strict email (user@domain.tld). */
+const LIGHTNING_ADDRESS_EMAIL_REGEX = /^[a-zA-Z0-9._+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/
 
 /**
  * Strips "lightning:" URI prefix (case-insensitive). The input is trimmed first.
@@ -90,6 +91,55 @@ export function validateLightningInvoice (address) {
 }
 
 /**
+ * @typedef {object} DecodedLightningInvoice
+ * @property {string} [paymentRequest]
+ * @property {boolean} [complete]
+ * @property {string} [prefix]
+ * @property {string} [wordsTemp]
+ * @property {object} [network]
+ * @property {number | null} [satoshis]
+ * @property {string | null} [millisatoshis]
+ * @property {number} [timestamp]
+ * @property {string} [timestampString]
+ * @property {number} [timeExpireDate]
+ * @property {string} [timeExpireDateString]
+ * @property {string} [payeeNodeKey]
+ * @property {string} [signature]
+ * @property {number} [recoveryFlag]
+ * @property {Array<{tagName: string, data: string | number | object}>} tags
+ */
+
+/**
+ * @typedef {{ success: true, type: 'invoice', data: DecodedLightningInvoice }} LightningInvoiceDecodingSuccess
+ * @typedef {{ success: false, reason: string }} LightningInvoiceDecodingFailure
+ * @typedef {LightningInvoiceDecodingSuccess | LightningInvoiceDecodingFailure} LightningInvoiceDecodingResult
+ */
+
+/**
+ * Decodes a BOLT11 Lightning Network invoice.
+ *
+ * @param {string} invoice The BOLT11 invoice string to decode.
+ * @returns {LightningInvoiceDecodingResult}
+ */
+export function decodeLightningInvoice (invoice) {
+  if (invoice == null || typeof invoice !== 'string') {
+    return { success: false, reason: 'INVALID_FORMAT' }
+  }
+
+  const trimmed = stripLightningPrefix(invoice)
+  if (trimmed.length === 0) {
+    return { success: false, reason: 'EMPTY_INVOICE' }
+  }
+
+  try {
+    const decoded = bolt11.decode(trimmed)
+    return { success: true, type: 'invoice', data: decoded }
+  } catch (e) {
+    return { success: false, reason: 'DECODING_FAILED' }
+  }
+}
+
+/**
  * @typedef {{ success: true, type: 'lnurl' }} LnurlValidationSuccess
  * @typedef {{ success: false, reason: string }} LnurlValidationFailure
  * @typedef {LnurlValidationSuccess | LnurlValidationFailure} LnurlValidationResult
@@ -121,6 +171,52 @@ export function validateLnurl (address) {
     if (e && e.message && e.message.toLowerCase().includes('lowercase or uppercase')) {
       return { success: false, reason: 'MIXED_CASE' }
     }
+    return { success: false, reason: 'INVALID_BECH32_FORMAT' }
+  }
+}
+
+/**
+ * @typedef {{ success: true, type: 'lnurl', data: string }} LnurlDecodingSuccess
+ * @typedef {{ success: false, reason: string }} LnurlDecodingFailure
+ * @typedef {LnurlDecodingSuccess | LnurlDecodingFailure} LnurlDecodingResult
+ */
+
+/**
+ * Decodes an LNURL address into its original URL.
+ *
+ * @param {string} address The LNURL to decode.
+ * @returns {LnurlDecodingResult}
+ */
+export function decodeLnurl (address) {
+  if (address == null || typeof address !== 'string') {
+    return { success: false, reason: 'INVALID_FORMAT' }
+  }
+
+  let lnurl = address.trim()
+  if (lnurl.length === 0) {
+    return { success: false, reason: 'EMPTY_ADDRESS' }
+  }
+
+  lnurl = stripLightningPrefix(lnurl)
+
+  if (lnurl.length === 0) {
+    return { success: false, reason: 'EMPTY_ADDRESS' }
+  }
+
+  if (!lnurl.toLowerCase().startsWith('lnurl1')) {
+    return { success: false, reason: 'INVALID_PREFIX' }
+  }
+
+  try {
+    const { words } = bech32.decode(lnurl, false)
+    const bytes = bech32.fromWords(words)
+    const url = Buffer.from(bytes).toString()
+    return { success: true, type: 'lnurl', data: url }
+  } catch (e) {
+    if (e && e.message && e.message.toLowerCase().includes('lowercase or uppercase')) {
+      return { success: false, reason: 'MIXED_CASE' }
+    }
+
     return { success: false, reason: 'INVALID_BECH32_FORMAT' }
   }
 }
