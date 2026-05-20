@@ -3,24 +3,56 @@ import { stripLightningPrefix } from './utils.js'
 import { sha256 } from '@noble/hashes/sha2'
 import { secp256k1 } from '@noble/curves/secp256k1.js'
 
+/** @typedef {string | number | Uint8Array} TagData */
+
 /**
- * @typedef {object} DecodedLightningInvoice
- * @property {string} [paymentRequest]
- * @property {boolean} [complete]
- * @property {string} [prefix]
- * @property {string} [wordsTemp]
- * @property {string} network
- * @property {string | null} [satoshis]
- * @property {string | null} [millisatoshis]
- * @property {number} [timestamp]
- * @property {string} [timestampString]
- * @property {number} [timeExpireDate]
- * @property {string} [timeExpireDateString]
- * @property {string} [payeeNodeKey]
- * @property {string} [signature]
- * @property {number} [recoveryFlag]
- * @property {Array<{tagName: string, data: string | number | object}>} tags
- */
+* @typedef {object} Tag
+* @property {string} tagName
+* @property {TagData} data
+*/
+
+/**
+* @typedef {object} DecodedLightningInvoice
+* @property {string} network
+* @property {string | null} [millisatoshis]
+* @property {number} [timestamp]
+* @property {number} [timeExpireDate]
+* @property {string} [payeeNodeKey]
+* @property {string} [signature]
+* @property {number} [recoveryFlag]
+* @property {Tag[]} tags
+* @property {string} [paymentRequest]
+*/
+
+/**
+* @typedef {{ success: true, type: 'invoice' }} LightningInvoiceValidationSuccess
+* @typedef {{ success: false, reason: string }} LightningInvoiceValidationFailure
+* @typedef {LightningInvoiceValidationSuccess | LightningInvoiceValidationFailure} LightningInvoiceValidationResult
+*/
+
+/**
+* @typedef {{ success: true, type: 'invoice', data: DecodedLightningInvoice }} LightningInvoiceDecodingSuccess
+* @typedef {{ success: false, reason: string }} LightningInvoiceDecodingFailure
+* @typedef {LightningInvoiceDecodingSuccess | LightningInvoiceDecodingFailure} LightningInvoiceDecodingResult
+*/
+
+/**
+* @typedef {{ success: true, type: 'hash', data: Uint8Array }} LightningInvoiceHashingSuccess
+* @typedef {{ success: false, reason: string }} LightningInvoiceHashingFailure
+* @typedef {LightningInvoiceHashingSuccess | LightningInvoiceHashingFailure} LightningInvoiceHashingResult
+*/
+
+/**
+* @typedef {{ success: true, type: 'invoice', data: DecodedLightningInvoice }} LightningInvoiceSigningSuccess
+* @typedef {{ success: false, reason: string }} LightningInvoiceSigningFailure
+* @typedef {LightningInvoiceSigningSuccess | LightningInvoiceSigningFailure} LightningInvoiceSigningResult
+*/
+
+/**
+* @typedef {{ success: true, type: 'invoice', data: string }} LightningInvoiceEncodingSuccess
+* @typedef {{ success: false, reason: string }} LightningInvoiceEncodingFailure
+* @typedef {LightningInvoiceEncodingSuccess | LightningInvoiceEncodingFailure} LightningInvoiceEncodingResult
+*/
 
 const VALID_PREFIXES = [
   { network: 'bitcoin', prefix: 'lnbc' },
@@ -67,7 +99,7 @@ const FORMAT_DECODERS = {
   hex: (words) => bytesToHex(bech32.fromWords(words)),
   string: (words) => new TextDecoder().decode(bech32.fromWords(words)),
   number: (words) => Number(wordsToIntBE(words)),
-  raw: (words) => words
+  raw: (words) => bech32.fromWords(words)
 }
 
 const FORMAT_ENCODERS = {
@@ -80,14 +112,8 @@ const FORMAT_ENCODERS = {
     for (let v = val; v > 0n; v >>= 5n) len++
     return intBEToWords(val, len)
   },
-  raw: (data) => data
+  raw: (data) => bech32.toWords(data)
 }
-
-/**
- * @typedef {{ success: true, type: 'invoice' }} LightningInvoiceValidationSuccess
- * @typedef {{ success: false, reason: string }} LightningInvoiceValidationFailure
- * @typedef {LightningInvoiceValidationSuccess | LightningInvoiceValidationFailure} LightningInvoiceValidationResult
- */
 
 /**
  * Validates a Lightning Network invoice (lnbc, lntb, lnbcrt, lni; length >= 20).
@@ -128,7 +154,7 @@ export function validateLightningInvoice (address) {
   }
 }
 
-function convertBits(data, from, to, pad) {
+function convertBits (data, from, to, pad) {
   let acc = 0
   let bits = 0
   const res = new Uint8Array(Math.ceil((data.length * from) / to))
@@ -190,33 +216,9 @@ function parseHrp (hrp) {
 }
 
 /**
- * @typedef {{ success: true, type: 'invoice', data: DecodedLightningInvoice }} LightningInvoiceDecodingSuccess
- * @typedef {{ success: false, reason: string }} LightningInvoiceDecodingFailure
- * @typedef {LightningInvoiceDecodingSuccess | LightningInvoiceDecodingFailure} LightningInvoiceDecodingResult
- */
-
-/**
- * @typedef {{ success: true, type: 'hash', data: Uint8Array }} LightningInvoiceHashingSuccess
- * @typedef {{ success: false, reason: string }} LightningInvoiceHashingFailure
- * @typedef {LightningInvoiceHashingSuccess | LightningInvoiceHashingFailure} LightningInvoiceHashingResult
- */
-
-/**
- * @typedef {{ success: true, type: 'invoice', data: DecodedLightningInvoice }} LightningInvoiceSigningSuccess
- * @typedef {{ success: false, reason: string }} LightningInvoiceSigningFailure
- * @typedef {LightningInvoiceSigningSuccess | LightningInvoiceSigningFailure} LightningInvoiceSigningResult
- */
-
-/**
- * @typedef {{ success: true, type: 'invoice', data: string }} LightningInvoiceEncodingSuccess
- * @typedef {{ success: false, reason: string }} LightningInvoiceEncodingFailure
- * @typedef {LightningInvoiceEncodingSuccess | LightningInvoiceEncodingFailure} LightningInvoiceEncodingResult
- */
-
-/**
  * Decodes a BOLT11 Lightning Network invoice.
  *
- * NOTE: Payment descriptions are user-defined and can contain injection attacks.
+ * Payment descriptions are user-defined and can contain injection attacks.
  * Always sanitize descriptions before rendering in HTML or persisting in databases.
  *
  * @param {string} invoice - The BOLT11 invoice string to decode.
@@ -238,7 +240,7 @@ export function decode (invoice) {
     }
 
     const timestamp = Number(wordsToIntBE(bodyWords.slice(0, 7)))
-  
+
     const tags = []
     const tagWords = bodyWords.slice(7)
     let index = 0
@@ -255,30 +257,30 @@ export function decode (invoice) {
       if (tagDef) {
         if (tagDef.length && length !== tagDef.length) return { success: false, reason: 'INVALID_TAG_LENGTH' }
         const parser = FORMAT_DECODERS[tagDef.format] || FORMAT_DECODERS.raw
-    
+
         tags.push({
           tagName: tagDef.name,
           data: parser(data)
         })
       }
-  
+
       index += 3 + length
     }
-  
+
     const hasDescription = tags.some(t => t.tagName === 'description')
     const hasPurposeCommitHash = tags.some(t => t.tagName === 'purpose_commit_hash')
-  
+
     if (!hasDescription && !hasPurposeCommitHash) return { success: false, reason: 'MISSING_DESCRIPTION' }
     if (hasDescription && hasPurposeCommitHash) return { success: false, reason: 'MUTUALLY_EXCLUSIVE_TAGS' }
     if (!tags.some(t => t.tagName === 'payment_hash')) return { success: false, reason: 'MISSING_PAYMENT_HASH' }
-  
+
     const uniqueTags = ['payment_hash', 'payment_secret', 'expiry', 'payee_node_key']
     for (const name of uniqueTags) {
       if (tags.filter(({ tagName }) => name === tagName).length > 1) {
         return { success: false, reason: 'DUPLICATE_TAG' }
       }
     }
-  
+
     const sigWords = words.slice(-104)
     const sigBytes = bech32.fromWords(sigWords)
     const signatureBytes = sigBytes.slice(0, 64)
@@ -307,22 +309,17 @@ export function decode (invoice) {
 
     /** @type {DecodedLightningInvoice} */
     const data = {
-      paymentRequest: invoiceString,
-      complete: true,
-      prefix,
       network: hrpData.network,
-      satoshis: hrpData.satoshis,
       millisatoshis: hrpData.millisatoshis,
       timestamp,
-      timestampString: new Date(timestamp * 1000).toISOString(),
       timeExpireDate,
-      timeExpireDateString: new Date(timeExpireDate * 1000).toISOString(),
       payeeNodeKey: recoveredPubKey,
       signature: bytesToHex(signatureBytes),
       recoveryFlag,
-      tags
+      tags,
+      paymentRequest: invoiceString
     }
-  
+
     return { success: true, type: 'invoice', data }
   } catch (e) {
     return { success: false, reason: 'DECODING_FAILED' }
@@ -465,11 +462,16 @@ function prepareWords (invoiceData) {
   const timestamp = BigInt(invoiceData.timestamp || Math.floor(Date.now() / 1000))
   const timestampWords = intBEToWords(timestamp, 7)
 
+  const tags = [...(invoiceData.tags || [])]
+
+  if (invoiceData.timeExpireDate && !tags.some(t => t.tagName === 'expiry')) {
+    const expiry = Math.max(0, Math.floor(invoiceData.timeExpireDate - Number(timestamp)))
+    tags.push({ tagName: 'expiry', data: expiry })
+  }
+
   const tagsWords = []
-  if (invoiceData.tags) {
-    for (const tag of invoiceData.tags) {
-      tagsWords.push(...encodeTag(tag.tagName, tag.data))
-    }
+  for (const tag of tags) {
+    tagsWords.push(...encodeTag(tag.tagName, tag.data))
   }
 
   const bodyWords = new Uint8Array(timestampWords.length + tagsWords.length)
