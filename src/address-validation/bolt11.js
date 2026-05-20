@@ -9,7 +9,7 @@ import { secp256k1 } from '@noble/curves/secp256k1.js'
  * @property {boolean} [complete]
  * @property {string} [prefix]
  * @property {string} [wordsTemp]
- * @property {object} [network]
+ * @property {string} network
  * @property {string | null} [satoshis]
  * @property {string | null} [millisatoshis]
  * @property {number} [timestamp]
@@ -22,7 +22,12 @@ import { secp256k1 } from '@noble/curves/secp256k1.js'
  * @property {Array<{tagName: string, data: string | number | object}>} tags
  */
 
-const VALID_INVOICE_PREFIXES = ['lnbc', 'lntb', 'lnbcrt', 'lnsb']
+const VALID_PREFIXES = [
+  { network: 'bitcoin', prefix: 'lnbc' },
+  { network: 'testnet', prefix: 'lntb' },
+  { network: 'regtest', prefix: 'lnbcrt' },
+  { network: 'signet', prefix: 'lnsb' }
+]
 const MULTIPLIER = {
   m: 1_000n,
   u: 1_000_000n,
@@ -49,11 +54,33 @@ const bytesToHex = (bytes) =>
     .map((b) => b.toString(16).padStart(2, '0'))
     .join('')
 
-const FORMAT_PARSERS = {
+const hexToBytes = (hex) => {
+  if (hex.length % 2 !== 0) throw new Error('INVALID_HEX_STRING')
+  const bytes = new Uint8Array(hex.length / 2)
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16)
+  }
+  return bytes
+}
+
+const FORMAT_DECODERS = {
   hex: (words) => bytesToHex(bech32.fromWords(words)),
   string: (words) => new TextDecoder().decode(bech32.fromWords(words)),
   number: (words) => Number(wordsToIntBE(words)),
   raw: (words) => words
+}
+
+const FORMAT_ENCODERS = {
+  hex: (data) => bech32.toWords(hexToBytes(data)),
+  string: (data) => bech32.toWords(new TextEncoder().encode(data)),
+  number: (data) => {
+    const val = BigInt(data)
+    if (val === 0n) return new Uint8Array([0])
+    let len = 0
+    for (let v = val; v > 0n; v >>= 5n) len++
+    return intBEToWords(val, len)
+  },
+  raw: (data) => data
 }
 
 /**
@@ -80,9 +107,9 @@ export function validateLightningInvoice (address) {
 
   const lowerInvoice = invoice.toLowerCase()
 
-  const hasValidPrefix = VALID_INVOICE_PREFIXES.some((prefix) =>
-    lowerInvoice.startsWith(prefix)
-  )
+  const hasValidPrefix = VALID_PREFIXES
+    .map(prefixObj => prefixObj.prefix)
+    .some((prefix) => lowerInvoice.startsWith(prefix))
   if (!hasValidPrefix) {
     return { success: false, reason: 'INVALID_PREFIX' }
   }
@@ -169,6 +196,24 @@ function parseHrp (hrp) {
  */
 
 /**
+ * @typedef {{ success: true, type: 'hash', data: Uint8Array }} LightningInvoiceHashingSuccess
+ * @typedef {{ success: false, reason: string }} LightningInvoiceHashingFailure
+ * @typedef {LightningInvoiceHashingSuccess | LightningInvoiceHashingFailure} LightningInvoiceHashingResult
+ */
+
+/**
+ * @typedef {{ success: true, type: 'invoice', data: DecodedLightningInvoice }} LightningInvoiceSigningSuccess
+ * @typedef {{ success: false, reason: string }} LightningInvoiceSigningFailure
+ * @typedef {LightningInvoiceSigningSuccess | LightningInvoiceSigningFailure} LightningInvoiceSigningResult
+ */
+
+/**
+ * @typedef {{ success: true, type: 'invoice', data: string }} LightningInvoiceEncodingSuccess
+ * @typedef {{ success: false, reason: string }} LightningInvoiceEncodingFailure
+ * @typedef {LightningInvoiceEncodingSuccess | LightningInvoiceEncodingFailure} LightningInvoiceEncodingResult
+ */
+
+/**
  * Decodes a BOLT11 Lightning Network invoice.
  *
  * NOTE: Payment descriptions are user-defined and can contain injection attacks.
@@ -209,7 +254,7 @@ export function decode (invoice) {
 
       if (tagDef) {
         if (tagDef.length && length !== tagDef.length) return { success: false, reason: 'INVALID_TAG_LENGTH' }
-        const parser = FORMAT_PARSERS[tagDef.format] || FORMAT_PARSERS.raw
+        const parser = FORMAT_DECODERS[tagDef.format] || FORMAT_DECODERS.raw
     
         tags.push({
           tagName: tagDef.name,
@@ -284,7 +329,6 @@ export function decode (invoice) {
   }
 }
 
-
 function wordsToIntBE (words) {
   let result = 0n
   for (const word of words) {
@@ -292,4 +336,231 @@ function wordsToIntBE (words) {
   }
 
   return result
+}
+
+/**
+ * Converts a BigInt into an array of 5-bit words (big-endian).
+ * @param {bigint} value
+ * @param {number} wordCount - Number of words to return (padded with leading zeros).
+ * @returns {Uint8Array}
+ */
+function intBEToWords (value, wordCount) {
+  const words = new Uint8Array(wordCount)
+  for (let i = wordCount - 1; i >= 0; i--) {
+    words[i] = Number(value & 0x1fn)
+    value >>= 5n
+  }
+  return words
+}
+
+/**
+ * Encode the HRP with network and amount
+ * @param {'bitcoin' | 'testnet' | 'regtest' | 'signet'} network
+ * @param {string | number | bigint} [millisatoshis]
+ * @returns {string}
+ */
+function encodeHrp (network, millisatoshis) {
+  const prefixObj = VALID_PREFIXES.find(p => p.network === network)
+  if (!prefixObj) throw new Error('Invalid network')
+  const prefix = prefixObj.prefix
+
+  if (!millisatoshis) return prefix
+
+  const msats = BigInt(millisatoshis)
+  if (msats <= 0n) return prefix
+
+  const BTC_MSATS = 10n ** 11n
+
+  if (msats % BTC_MSATS === 0n) return prefix + (msats / BTC_MSATS).toString()
+
+  for (const [key, value] of Object.entries(MULTIPLIER)) {
+    if (key === 'p') continue
+
+    const unit = BTC_MSATS / value
+    if (msats % unit === 0n) {
+      return prefix + (msats / unit).toString() + key
+    }
+  }
+
+  // 1 pBTC = 0.1 millisatoshis
+  return prefix + (msats * 10n).toString() + 'p'
+}
+
+function encodeTag (tagName, data) {
+  try {
+    const tagDef = TAG_DEFS.find(t => t.name === tagName)
+    if (!tagDef) throw new Error('UNKNOWN_TAG')
+
+    const encoder = FORMAT_ENCODERS[tagDef.format] || FORMAT_ENCODERS.raw
+    const words = encoder(data)
+
+    if (tagDef.length && words.length !== tagDef.length) {
+      throw new Error('INVALID_TAG_LENGTH')
+    }
+
+    const tagWords = new Uint8Array(3 + words.length)
+    tagWords[0] = tagDef.code
+    tagWords[1] = words.length >> 5
+    tagWords[2] = words.length & 0x1f
+    tagWords.set(words, 3)
+
+    return tagWords
+  } catch (e) {
+    throw new Error(e.message.startsWith('ENCODE_TAG_FAILED') ? e.message : `ENCODE_TAG_FAILED: ${tagName} (${e.message})`)
+  }
+}
+
+/**
+ * Validates the structure and mandatory fields of a BOLT11 invoice object.
+ * @param {DecodedLightningInvoice} invoiceData
+ * @throws {Error} If validation fails
+ */
+export function validateInvoiceData (invoiceData) {
+  if (!invoiceData.network) throw new Error('NETWORK_REQUIRED')
+  if (!VALID_PREFIXES.some(p => p.network === invoiceData.network)) {
+    throw new Error('INVALID_NETWORK')
+  }
+
+  const tags = invoiceData.tags || []
+  const tagNames = tags.map(t => t.tagName)
+
+  if (!tagNames.includes('payment_hash')) {
+    throw new Error('MISSING_PAYMENT_HASH')
+  }
+
+  const hasDescription = tagNames.includes('description')
+  const hasDescriptionHash = tagNames.includes('purpose_commit_hash')
+
+  if (!hasDescription && !hasDescriptionHash) {
+    throw new Error('MISSING_DESCRIPTION')
+  }
+  if (hasDescription && hasDescriptionHash) {
+    throw new Error('MUTUALLY_EXCLUSIVE_TAGS')
+  }
+
+  const uniqueTags = ['payment_hash', 'payment_secret', 'expiry', 'payee_node_key']
+  for (const name of uniqueTags) {
+    if (tags.filter(t => t.tagName === name).length > 1) {
+      throw new Error('DUPLICATE_TAG')
+    }
+  }
+
+  if (invoiceData.millisatoshis) {
+    const msats = BigInt(invoiceData.millisatoshis)
+    if (msats > MAX_MILLISATS) {
+      throw new Error('AMOUNT_TOO_LARGE')
+    }
+  }
+
+  const timestamp = BigInt(invoiceData.timestamp || Math.floor(Date.now() / 1000))
+  if (timestamp >= 2n ** 35n) {
+    throw new Error('TIMESTAMP_TOO_LARGE')
+  }
+}
+
+function prepareWords (invoiceData) {
+  validateInvoiceData(invoiceData)
+  const hrp = encodeHrp(invoiceData.network, invoiceData.millisatoshis)
+
+  const timestamp = BigInt(invoiceData.timestamp || Math.floor(Date.now() / 1000))
+  const timestampWords = intBEToWords(timestamp, 7)
+
+  const tagsWords = []
+  if (invoiceData.tags) {
+    for (const tag of invoiceData.tags) {
+      tagsWords.push(...encodeTag(tag.tagName, tag.data))
+    }
+  }
+
+  const bodyWords = new Uint8Array(timestampWords.length + tagsWords.length)
+  bodyWords.set(timestampWords)
+  bodyWords.set(new Uint8Array(tagsWords), timestampWords.length)
+
+  return { hrp, bodyWords }
+}
+
+/**
+ * Returns the SHA-256 hash that needs to be signed for an invoice.
+ * @param {DecodedLightningInvoice} invoiceData
+ * @returns {LightningInvoiceHashingResult}
+ */
+export function getHashToSign (invoiceData) {
+  try {
+    const { hrp, bodyWords } = prepareWords(invoiceData)
+
+    const hrpBytes = new TextEncoder().encode(hrp)
+    const bodyBytes = convertBits(bodyWords, 5, 8, true)
+    const toSign = new Uint8Array(hrpBytes.length + bodyBytes.length)
+    toSign.set(hrpBytes)
+    toSign.set(bodyBytes, hrpBytes.length)
+
+    return { success: true, type: 'hash', data: sha256(toSign) }
+  } catch (e) {
+    return { success: false, reason: e.message }
+  }
+}
+
+/**
+ * Signs a BOLT11 invoice.
+ * @param {DecodedLightningInvoice} invoiceData
+ * @param {string | Uint8Array} privateKey - Hex-encoded string or Uint8Array
+ * @returns {LightningInvoiceSigningResult} The signed invoice data
+ */
+export function sign (invoiceData, privateKey) {
+  let privKeyBytes
+  try {
+    const hashResult = getHashToSign(invoiceData)
+    if (!hashResult.success) return hashResult
+
+    privKeyBytes = typeof privateKey === 'string'
+      ? hexToBytes(privateKey)
+      : new Uint8Array(privateKey)
+
+    const sig = secp256k1.sign(hashResult.data, privKeyBytes)
+
+    return {
+      success: true,
+      type: 'invoice',
+      data: {
+        ...invoiceData,
+        signature: bytesToHex(sig.toCompactRawBytes()),
+        recoveryFlag: sig.recovery
+      }
+    }
+  } catch (e) {
+    return { success: false, reason: 'SIGNING_FAILED' }
+  } finally {
+    if (privKeyBytes) {
+      privKeyBytes.fill(0)
+    }
+  }
+}
+
+/**
+ * Encodes a BOLT11 invoice.
+ * @param {DecodedLightningInvoice} invoiceData
+ * @returns {LightningInvoiceEncodingResult}
+ */
+export function encode (invoiceData) {
+  try {
+    if (!invoiceData.signature || invoiceData.recoveryFlag === undefined) {
+      return { success: false, reason: 'MISSING_SIGNATURE' }
+    }
+
+    const { hrp, bodyWords } = prepareWords(invoiceData)
+
+    const sigBytes = new Uint8Array(65)
+    sigBytes.set(hexToBytes(invoiceData.signature))
+    sigBytes[64] = invoiceData.recoveryFlag
+
+    const sigWords = bech32.toWords(sigBytes)
+
+    const finalWords = new Uint8Array(bodyWords.length + sigWords.length)
+    finalWords.set(bodyWords)
+    finalWords.set(sigWords, bodyWords.length)
+
+    return { success: true, type: 'invoice', data: bech32.encode(hrp, finalWords, false) }
+  } catch (e) {
+    return { success: false, reason: e.message.includes(' ') ? 'ENCODING_FAILED' : e.message }
+  }
 }

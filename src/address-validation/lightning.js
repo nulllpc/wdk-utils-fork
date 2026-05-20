@@ -20,72 +20,58 @@
  */
 
 import { bech32 } from '@scure/base'
+import * as bolt11 from 'bolt11'
+import { stripLightningPrefix } from './utils.js'
 
-const VALID_INVOICE_PREFIXES = ['lnbc', 'lntb', 'lnbcrt', 'lnsb']
 /** Lightning address: strict email (user@domain.tld). */
 const LIGHTNING_ADDRESS_EMAIL_REGEX = /^[a-zA-Z0-9._+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/
 
 /**
- * Strips "lightning:" URI prefix (case-insensitive). The input is trimmed first.
- *
- * @param {string} input
- * @returns {string} Returns a string. Returns an empty string if input is not a string.
- */
-export function stripLightningPrefix (input) {
-  if (typeof input !== 'string') {
-    return ''
-  }
-
-  const trimmed = input.trim()
-  if (trimmed.toLowerCase().startsWith('lightning:')) {
-    return trimmed.slice(10).trim()
-  }
-
-  return trimmed
-}
-
-/**
- * @typedef {{ success: true, type: 'invoice' }} LightningInvoiceValidationSuccess
- * @typedef {{ success: false, reason: string }} LightningInvoiceValidationFailure
- * @typedef {LightningInvoiceValidationSuccess | LightningInvoiceValidationFailure} LightningInvoiceValidationResult
+ * @typedef {object} DecodedLightningInvoice
+ * @property {string} [paymentRequest]
+ * @property {boolean} [complete]
+ * @property {string} [prefix]
+ * @property {string} [wordsTemp]
+ * @property {object} [network]
+ * @property {number | null} [satoshis]
+ * @property {string | null} [millisatoshis]
+ * @property {number} [timestamp]
+ * @property {string} [timestampString]
+ * @property {number} [timeExpireDate]
+ * @property {string} [timeExpireDateString]
+ * @property {string} [payeeNodeKey]
+ * @property {string} [signature]
+ * @property {number} [recoveryFlag]
+ * @property {Array<{tagName: string, data: string | number | object}>} tags
  */
 
 /**
- * Validates a Lightning Network invoice (lnbc, lntb, lnbcrt, lni; length >= 20).
- *
- * @param {string} address The invoice to validate.
- * @returns {LightningInvoiceValidationResult}
+ * @typedef {{ success: true, type: 'invoice', data: DecodedLightningInvoice }} LightningInvoiceDecodingSuccess
+ * @typedef {{ success: false, reason: string }} LightningInvoiceDecodingFailure
+ * @typedef {LightningInvoiceDecodingSuccess | LightningInvoiceDecodingFailure} LightningInvoiceDecodingResult
  */
-export function validateLightningInvoice (address) {
-  if (address == null || typeof address !== 'string') {
+
+/**
+ * Decodes a BOLT11 Lightning Network invoice.
+ *
+ * @param {string} invoice The BOLT11 invoice string to decode.
+ * @returns {LightningInvoiceDecodingResult}
+ */
+export function decodeLightningInvoice (invoice) {
+  if (invoice == null || typeof invoice !== 'string') {
     return { success: false, reason: 'INVALID_FORMAT' }
   }
 
-  const invoice = stripLightningPrefix(address)
-  if (invoice.length === 0) {
-    return { success: false, reason: 'EMPTY_ADDRESS' }
+  const trimmed = stripLightningPrefix(invoice)
+  if (trimmed.length === 0) {
+    return { success: false, reason: 'EMPTY_INVOICE' }
   }
 
-  const lowerInvoice = invoice.toLowerCase()
-
-  const hasValidPrefix = VALID_INVOICE_PREFIXES.some((prefix) =>
-    lowerInvoice.startsWith(prefix)
-  )
-  if (!hasValidPrefix) {
-    return { success: false, reason: 'INVALID_PREFIX' }
-  }
-  if (invoice.length < 20) {
-    return { success: false, reason: 'INVALID_LENGTH' }
-  }
   try {
-    bech32.decode(invoice, false)
-    return { success: true, type: 'invoice' }
+    const decoded = bolt11.decode(trimmed)
+    return { success: true, type: 'invoice', data: decoded }
   } catch (e) {
-    if (e && e.message && e.message.toLowerCase().includes('lowercase or uppercase')) {
-      return { success: false, reason: 'MIXED_CASE' }
-    }
-
-    return { success: false, reason: 'INVALID_BECH32_FORMAT' }
+    return { success: false, reason: 'DECODING_FAILED' }
   }
 }
 

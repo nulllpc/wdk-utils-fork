@@ -23,6 +23,7 @@
     "lint:fix": "standard --fix"
   },
   "dependencies": {
+    "@noble/curves": "^2.2.0",
     "@noble/hashes": "^1.4.0",
     "@scure/base": "^2.0.0",
     "bare-node-runtime": "^1.2.0"
