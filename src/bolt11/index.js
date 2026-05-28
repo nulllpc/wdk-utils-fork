@@ -13,10 +13,11 @@
 // limitations under the License.
 'use strict'
 
-import { bech32 } from '@scure/base'
+import { bech32, bech32m, createBase58check } from '@scure/base'
 import { stripLightningPrefix } from '../address-validation/utils.js'
 import { sha256 } from '@noble/hashes/sha2'
 import { secp256k1 } from '@noble/curves/secp256k1.js'
+import { validateBitcoinAddress } from '../address-validation/bitcoin.js'
 
 /** @typedef {string | number | Uint8Array} TagData */
 
@@ -69,11 +70,12 @@ import { secp256k1 } from '@noble/curves/secp256k1.js'
 * @typedef {LightningInvoiceEncodingSuccess | LightningInvoiceEncodingFailure} LightningInvoiceEncodingResult
 */
 
+const base58check = createBase58check(sha256)
 const VALID_PREFIXES = [
-  { network: 'bitcoin', prefix: 'lnbc' },
-  { network: 'testnet', prefix: 'lntb' },
-  { network: 'regtest', prefix: 'lnbcrt' },
-  { network: 'signet', prefix: 'lnsb' }
+  { network: 'regtest', prefix: 'lnbcrt', bech32: 'bcrt', p2pkh: 0x6f, p2sh: 0xc4 },
+  { network: 'bitcoin', prefix: 'lnbc', bech32: 'bc', p2pkh: 0x00, p2sh: 0x05 },
+  { network: 'testnet', prefix: 'lntb', bech32: 'tb', p2pkh: 0x6f, p2sh: 0xc4 },
+  { network: 'signet', prefix: 'lnsb', bech32: 'tb', p2pkh: 0x6f, p2sh: 0xc4 }
 ]
 const MULTIPLIER = {
   m: 1_000n,
@@ -90,9 +92,9 @@ const TAG_DEFS = [
   { char: 'h', code: 23, name: 'purpose_commit_hash', format: 'hex', length: 52 },
   { char: 'x', code: 6, name: 'expiry', format: 'number' },
   { char: 'c', code: 24, name: 'min_final_cltv_expiry', format: 'number' },
-  { char: 'f', code: 9, name: 'fallback_address', format: 'raw' },
-  { char: 'r', code: 3, name: 'routing_info', format: 'raw' },
-  { char: '9', code: 5, name: 'feature_bits', format: 'raw' }
+  { char: 'f', code: 9, name: 'fallback_address', format: 'fallback_address' },
+  { char: 'r', code: 3, name: 'routing_info', format: 'routing_info' },
+  { char: '9', code: 5, name: 'feature_bits', format: 'feature_bits' }
 ]
 const TAG_BY_CODE = Object.fromEntries(TAG_DEFS.map((t) => [t.code, t]))
 
@@ -114,7 +116,49 @@ const FORMAT_DECODERS = {
   hex: (words) => bytesToHex(bech32.fromWords(words)),
   string: (words) => new TextDecoder().decode(bech32.fromWords(words)),
   number: (words) => Number(wordsToIntBE(words)),
-  raw: (words) => bech32.fromWords(words)
+  feature_bits: (words) => words,
+  fallback_address: (words, networkInfo) => {
+    if (words.length < 1) throw new Error('INVALID_FALLBACK_ADDRESS_DATA')
+    const version = words[0]
+    const hash = bech32.fromWords(words.slice(1))
+    const addressHash = bytesToHex(hash)
+
+    let address = null
+    if (networkInfo) {
+      if (version === 17) {
+        const payload = new Uint8Array(21)
+        payload[0] = networkInfo.p2pkh
+        payload.set(hash, 1)
+        address = base58check.encode(payload)
+      } else if (version === 18) {
+        const payload = new Uint8Array(21)
+        payload[0] = networkInfo.p2sh
+        payload.set(hash, 1)
+        address = base58check.encode(payload)
+      } else if (version <= 16) {
+        const encoder = version === 0 ? bech32 : bech32m
+        address = encoder.encode(networkInfo.bech32, [version, ...bech32.toWords(hash)])
+      }
+    }
+
+    return { version, addressHash, address, code: version }
+  },
+  routing_info: (words) => {
+    const routes = []
+    const bytes = bech32.fromWords(words)
+    if (bytes.length % 51 !== 0) throw new Error('INVALID_ROUTING_INFO_LENGTH')
+    for (let i = 0; i < bytes.length; i += 51) {
+      routes.push({
+        pubkey: bytesToHex(bytes.slice(i, i + 33)),
+        short_channel_id: bytesToHex(bytes.slice(i + 33, i + 41)),
+        fee_base_msat: Number(BigInt('0x' + bytesToHex(bytes.slice(i + 41, i + 45)))),
+        fee_proportional_millionths: Number(BigInt('0x' + bytesToHex(bytes.slice(i + 45, i + 49)))),
+        cltv_expiry_delta: (bytes[i + 49] << 8) | bytes[i + 50]
+      })
+    }
+    return routes
+  },
+  raw: (words) => words
 }
 
 const FORMAT_ENCODERS = {
@@ -127,7 +171,92 @@ const FORMAT_ENCODERS = {
     for (let v = val; v > 0n; v >>= 5n) len++
     return intBEToWords(val, len)
   },
-  raw: (data) => bech32.toWords(data)
+  feature_bits: (data) => {
+    if (!Array.isArray(data)) throw new Error('INVALID_FEATURE_BITS_FORMAT')
+    if (data.some(w => typeof w !== 'number' || w < 0 || w > 31)) throw new Error('INVALID_FEATURE_BITS_DATA')
+    return new Uint8Array(data)
+  },
+  fallback_address: (data, networkInfo) => {
+    let version, addressHash
+
+    if (typeof data === 'string') {
+      const validation = validateBitcoinAddress(data)
+      if (!validation.success) throw new Error('INVALID_FALLBACK_ADDRESS')
+
+      if (networkInfo) {
+        const isBtcMainnet = networkInfo.network === 'bitcoin' && validation.network === 'mainnet'
+        const isBtcTestnet = networkInfo.network === 'testnet' && (validation.network === 'testnet' || validation.network === 'signet')
+        const isBtcRegtest = networkInfo.network === 'regtest' && validation.network === 'regtest'
+
+        if (!isBtcMainnet && !isBtcTestnet && !isBtcRegtest) {
+          throw new Error('FALLBACK_ADDRESS_NETWORK_MISMATCH')
+        }
+      }
+
+      if (validation.type === 'p2pkh') version = 17
+      else if (validation.type === 'p2sh') version = 18
+      else if (validation.type === 'bech32' || validation.type === 'bech32m') {
+        const decoded = (validation.type === 'bech32' ? bech32 : bech32m).decode(data)
+        version = decoded.words[0]
+      } else {
+        throw new Error('UNSUPPORTED_ADDRESS_TYPE')
+      }
+
+      if (validation.type === 'p2pkh' || validation.type === 'p2sh') {
+        const decoded = base58check.decode(data)
+        addressHash = bytesToHex(decoded.slice(1))
+      } else {
+        const b = (validation.type === 'bech32' ? bech32 : bech32m)
+        const decoded = b.decode(data)
+        addressHash = bytesToHex(b.fromWords(decoded.words.slice(1)))
+      }
+    } else if (data && typeof data === 'object') {
+      version = data.version !== undefined ? data.version : data.code
+      addressHash = data.addressHash
+    } else {
+      throw new Error('INVALID_FALLBACK_ADDRESS_FORMAT')
+    }
+
+    if (typeof version !== 'number' || version < 0 || version > 31) throw new Error('INVALID_FALLBACK_ADDRESS_VERSION')
+    if (typeof addressHash !== 'string') throw new Error('INVALID_FALLBACK_ADDRESS_HASH_TYPE')
+
+    const hashBytes = hexToBytes(addressHash)
+    const hashWords = bech32.toWords(hashBytes)
+    const result = new Uint8Array(1 + hashWords.length)
+    result[0] = version
+    result.set(hashWords, 1)
+    return result
+  },
+  routing_info: (data) => {
+    if (!Array.isArray(data)) throw new Error('INVALID_ROUTING_INFO_FORMAT')
+    const bytes = new Uint8Array(data.length * 51)
+    data.forEach((route, i) => {
+      if (!route.pubkey || !route.short_channel_id || route.fee_base_msat === undefined ||
+          route.fee_proportional_millionths === undefined || route.cltv_expiry_delta === undefined) {
+        throw new Error('MISSING_ROUTING_INFO_FIELDS')
+      }
+      const pubkeyBytes = hexToBytes(route.pubkey)
+      if (pubkeyBytes.length !== 33) throw new Error('INVALID_ROUTING_INFO_PUBKEY_LENGTH')
+      const scidBytes = hexToBytes(route.short_channel_id)
+      if (scidBytes.length !== 8) throw new Error('INVALID_ROUTING_INFO_SCID_LENGTH')
+
+      bytes.set(pubkeyBytes, i * 51)
+      bytes.set(scidBytes, i * 51 + 33)
+
+      const baseFee = new Uint8Array(4)
+      new DataView(baseFee.buffer).setUint32(0, Number(route.fee_base_msat))
+      bytes.set(baseFee, i * 51 + 41)
+
+      const propFee = new Uint8Array(4)
+      new DataView(propFee.buffer).setUint32(0, Number(route.fee_proportional_millionths))
+      bytes.set(propFee, i * 51 + 45)
+
+      bytes[i * 51 + 49] = Number(route.cltv_expiry_delta) >> 8
+      bytes[i * 51 + 50] = Number(route.cltv_expiry_delta) & 0xff
+    })
+    return bech32.toWords(bytes)
+  },
+  raw: (data) => { throw new Error('UNSUPPORTED_TAG_DATA_TYPE') }
 }
 
 /**
@@ -191,20 +320,16 @@ function convertBits (data, from, to, pad) {
 function parseHrp (hrp) {
   let network, amountPart
 
-  if (hrp.startsWith('lnbcrt')) {
-    network = 'regtest'
-    amountPart = hrp.slice(6)
-  } else if (hrp.startsWith('lntb')) {
-    network = 'testnet'
-    amountPart = hrp.slice(4)
-  } else if (hrp.startsWith('lnbc')) {
-    network = 'bitcoin'
-    amountPart = hrp.slice(4)
-  } else if (hrp.startsWith('lnsb')) {
-    network = 'signet'
-    amountPart = hrp.slice(4)
-  } else {
-    throw new Error('Invalid HRP')
+  for (const prefixObj of VALID_PREFIXES) {
+    if (hrp.startsWith(prefixObj.prefix)) {
+      network = prefixObj.network
+      amountPart = hrp.slice(prefixObj.prefix.length)
+      break
+    }
+  }
+
+  if (!network) {
+    throw new Error('INVALID_HRP')
   }
 
   if (!amountPart) return { network, satoshis: null, millisatoshis: null }
@@ -248,6 +373,7 @@ export function decode (invoice) {
   try {
     const { prefix, words } = bech32.decode(invoiceString, false)
     const hrpData = parseHrp(prefix)
+    const networkInfo = VALID_PREFIXES.find(p => p.network === hrpData.network)
     const bodyWords = words.slice(0, -104)
 
     if (bodyWords.length < 7) {
@@ -275,7 +401,7 @@ export function decode (invoice) {
 
         tags.push({
           tagName: tagDef.name,
-          data: parser(data)
+          data: parser(data, networkInfo)
         })
       }
 
@@ -337,7 +463,7 @@ export function decode (invoice) {
 
     return { success: true, type: 'invoice', data }
   } catch (e) {
-    return { success: false, reason: 'DECODING_FAILED' }
+    return { success: false, reason: e.message ?? 'DECODING_FAILED' }
   }
 }
 
@@ -398,13 +524,13 @@ function encodeHrp (network, millisatoshis) {
   return prefix + (msats * 10n).toString() + 'p'
 }
 
-function encodeTag (tagName, data) {
+function encodeTag (tagName, data, networkInfo) {
   try {
     const tagDef = TAG_DEFS.find(t => t.name === tagName)
     if (!tagDef) throw new Error('UNKNOWN_TAG')
 
     const encoder = FORMAT_ENCODERS[tagDef.format] || FORMAT_ENCODERS.raw
-    const words = encoder(data)
+    const words = encoder(data, networkInfo)
 
     if (tagDef.length && words.length !== tagDef.length) {
       throw new Error('INVALID_TAG_LENGTH')
@@ -463,8 +589,9 @@ function validateInvoiceData (invoiceData) {
 
 function prepareWords (invoiceData) {
   validateInvoiceData(invoiceData)
-  const hrp = encodeHrp(invoiceData.network, invoiceData.millisatoshis)
 
+  const networkInfo = VALID_PREFIXES.find(p => p.network === invoiceData.network)
+  const hrp = encodeHrp(invoiceData.network, invoiceData.millisatoshis)
   const timestamp = BigInt(invoiceData.timestamp || Math.floor(Date.now() / 1000))
   const timestampWords = intBEToWords(timestamp, 7)
 
@@ -477,9 +604,9 @@ function prepareWords (invoiceData) {
 
   const tagsWords = []
   for (const tag of tags) {
-    if (['fallback_address', 'routing_info', 'feature_bits'].includes(tag.tagName)) continue
-    tagsWords.push(...encodeTag(tag.tagName, tag.data))
+    tagsWords.push(...encodeTag(tag.tagName, tag.data, networkInfo))
   }
+
 
   const bodyWords = new Uint8Array(timestampWords.length + tagsWords.length)
   bodyWords.set(timestampWords)
